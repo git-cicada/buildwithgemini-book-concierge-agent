@@ -106,6 +106,75 @@ async def generate_cover_art(
     }
 
 
+async def generate_book_trailer(
+    tool_context: ToolContext,
+    prompt: str,
+    title: str = "custom_book",
+) -> dict:
+    """Generate a short video trailer for a book using Google's Omni model (gemini-omni-flash-preview), save it as a session artifact, and upload it to public Cloud Storage.
+
+    Args:
+        tool_context: The ADK ToolContext injected automatically at runtime.
+        prompt: Visual scene or cinematic description for the book trailer (e.g., 'Cinematic video of glowing magical book floating in an ancient library').
+        title: Title of the book or filename identifier for saving the trailer video.
+
+    Returns:
+        A status dictionary containing the public Cloud Storage video URL and artifact details.
+    """
+    import base64
+    import google.genai as genai
+    from google.cloud import storage
+    from google.genai import types
+
+    try:
+        # Generate video using gemini-omni-flash-preview in global region via Interactions API
+        client = genai.Client(vertexai=True, project=FIRESTORE_PROJECT_ID, location="global")
+        full_prompt = f"Generate a short 3-second video trailer for the book '{title}': {prompt}"
+        interaction = client.interactions.create(
+            model="gemini-omni-flash-preview",
+            input=full_prompt,
+        )
+
+        video_bytes = None
+        outputs = getattr(interaction, "outputs", None) or []
+        if not outputs and hasattr(interaction, "model_dump"):
+            outputs = interaction.model_dump().get("outputs", [])
+
+        for out in outputs:
+            b64 = getattr(out, "bytes_base64", None) if not isinstance(out, dict) else out.get("bytes_base64")
+            if b64:
+                video_bytes = base64.b64decode(b64)
+                break
+
+        if not video_bytes:
+            return {"status": "error", "message": "Failed to generate video bytes from prompt."}
+
+        safe_title = "".join(c if c.isalnum() else "_" for c in title.lower())
+        filename = f"{safe_title}_trailer.mp4"
+        blob_name = f"trailers/{filename}"
+
+        # 1. Save artifact in Playground's Artifacts panel via tool_context
+        artifact_part = types.Part.from_bytes(data=video_bytes, mime_type="video/mp4")
+        await tool_context.save_artifact(filename=filename, artifact=artifact_part)
+
+        # 2. Upload same video bytes to public Cloud Storage bucket
+        storage_client = storage.Client(project=FIRESTORE_PROJECT_ID)
+        bucket = storage_client.bucket(MEDIA_BUCKET_NAME)
+        blob = bucket.blob(blob_name)
+        blob.upload_from_string(video_bytes, content_type="video/mp4")
+
+        public_url = f"https://storage.googleapis.com/{MEDIA_BUCKET_NAME}/{blob_name}"
+        return {
+            "status": "success",
+            "message": f"Generated video trailer for '{title}'",
+            "artifact_saved": filename,
+            "video_url": public_url,
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"Video generation failed: {str(e)}"}
+
+
+
 def list_books(genre: str | None = None, status: str | None = None) -> list[dict]:
     """Retrieve books from the reading list / library stored in Firestore.
 
@@ -307,7 +376,8 @@ instruction = schema_manager.generate_system_prompt(
     role_description=(
         "You are a helpful Book Concierge AI assistant. You help readers manage their "
         "reading list, track bookmarks/page progress, discover real books from the public "
-        "Open Library catalog, query stored books in Firestore, and generate custom book cover art."
+        "Open Library catalog, query stored books in Firestore, generate custom book cover art, "
+        "and generate short cinematic book trailer videos using generative AI."
     ),
     workflow_description="Analyze the user request, call function tools when appropriate, and return structured UI components.",
     ui_description=(
@@ -345,6 +415,7 @@ root_agent = Agent(
         add_book,
         update_reading_bookmark,
         generate_cover_art,
+        generate_book_trailer,
         search_public_books,
         get_weather,
         get_current_time,
